@@ -17,10 +17,11 @@ READING_INTERVAL = 600000  # 10 minute
 wlan = network.WLAN(network.STA_IF)
 rgb = RGB()
 env_sensor = None
-ble = ubluetooth.BLE()
+ble = None
 mac_address = ''.join('{:02X}'.format(b) for b in wlan.config('mac'))
 is_registered = False
 is_pairing = False
+ble_initialized = False
 last_reading = 0
 last_check = 0
 char_handle = None
@@ -66,7 +67,10 @@ def api_call(method, endpoint, data=None):
 
 def ble_irq(event, data):
     """Handle BLE events"""
-    global is_registered, is_pairing, last_reading
+    global is_registered, is_pairing, last_reading, ble_initialized
+    if not ble or not ble_initialized:
+        return
+        
     if event == 1:  # Connect
         conn_handle = data[0]
         connections.add(conn_handle)
@@ -76,13 +80,18 @@ def ble_irq(event, data):
         start_advertising()
     elif event == 3:  # Write
         conn_handle, value_handle = data
-        value = ble.gatts_read(value_handle)
+        try:
+            value = ble.gatts_read(value_handle)
+        except Exception as e:
+            print(f'GATT read error: {e}')
+            return
         if value == b'GET_READINGS' and env_sensor:
             readings = f'{{"temp":{env_sensor.read_temperature()},"humidity":{env_sensor.read_humidity()},"pressure":{env_sensor.read_pressure()}}}'
             try:
-                ble.gatts_notify(conn_handle, char_handle, readings.encode())
-            except:
-                pass
+                if ble and ble_initialized and char_handle:
+                    ble.gatts_notify(conn_handle, char_handle, readings.encode())
+            except Exception as e:
+                print(f'Notify error: {e}')
         elif value == b'REGISTER':
             status, _ = api_call('POST', 'devices', requests2.urlencode({
                 'mac_address': mac_address,
@@ -97,19 +106,27 @@ def ble_irq(event, data):
                 print('Device registered - immediate reading scheduled')
                 has_error = False
                 try:
-                    ble.gatts_notify(conn_handle, char_handle, b'REGISTERED')
-                except:
-                    pass
+                    if ble and ble_initialized and char_handle:
+                        ble.gatts_notify(conn_handle, char_handle, b'REGISTERED')
+                        # Wait a moment for the notification to be sent
+                        time.sleep(1)
+                except Exception as e:
+                    print(f'Registration notify error: {e}')
+                # Disable BLE after successful registration and notification
+                disable_ble()
             else:
                 print(f'Registration failed: {status}')
                 has_error = True
                 try:
-                    ble.gatts_notify(conn_handle, char_handle, b'REGISTER_FAILED')
-                except:
-                    pass
+                    if ble and ble_initialized and char_handle:
+                        ble.gatts_notify(conn_handle, char_handle, b'REGISTER_FAILED')
+                except Exception as e:
+                    print(f'Registration failed notify error: {e}')
 
 def start_advertising():
     """Start BLE advertising"""
+    if not ble:
+        return
     name = f'NanoC6-{mac_address[-6:]}'
     adv_data = bytes([0x02, 0x01, 0x06, 0x02, 0x0A, 0x1A, len(name) + 1, 0x09]) + name.encode()
     try:
@@ -117,16 +134,45 @@ def start_advertising():
     except:
         pass
 
+def disable_ble():
+    """Disable BLE to save power"""
+    global ble, ble_initialized, connections, char_handle
+    if ble and ble_initialized:
+        try:
+            # Disconnect all active connections first
+            for conn in list(connections):
+                try:
+                    ble.gap_disconnect(conn)
+                except:
+                    pass
+            connections.clear()
+            
+            # Stop advertising and deactivate
+            ble.gap_advertise(None)
+            ble.active(False)
+            ble_initialized = False
+            char_handle = None
+            print('BLE disabled and connections cleared')
+        except Exception as e:
+            print(f'BLE disable error: {e}')
+            # Force reset state even if disable fails
+            ble_initialized = False
+            char_handle = None
+            connections.clear()
+
 def init_ble():
     """Initialize BLE"""
-    global char_handle
+    global char_handle, ble, ble_initialized
     try:
+        if not ble:
+            ble = ubluetooth.BLE()
         ble.active(True)
         ble.irq(ble_irq)
         services = ((SERVICE_UUID, ((CHAR_UUID, 0x001A),)),)
         ((char_handle,),) = ble.gatts_register_services(services)
         ble.gatts_write(char_handle, b'Ready')
         start_advertising()
+        ble_initialized = True
         return True
     except Exception as e:
         print(f'BLE init error: {e}')
@@ -180,10 +226,24 @@ def take_reading():
 def btn_hold_event(state):
     """Handle button hold - start pairing"""
     global is_pairing
-    if not is_registered and not is_pairing:
+    if is_registered:
+        print('Device already registered - pairing not needed')
+        # Flash white to indicate already registered
+        rgb.fill_color(0xffffff)
+        time.sleep(0.5)
+        rgb.fill_color(0x000000)
+        return
+        
+    if not is_pairing:
         is_pairing = True
         rgb.fill_color(0x0000ff)
-        print('Pairing mode started')
+        print('Pairing mode started - enabling Bluetooth')
+        if init_ble():
+            print('BLE initialized successfully')
+        else:
+            print('BLE initialization failed')
+            is_pairing = False
+            has_error = True
 
 def setup():
     """Initialize hardware"""
@@ -208,10 +268,14 @@ def setup():
     
     print(f'MAC: {mac_address}')
     
-    if init_ble():
-        check_registration()
-        if is_registered:
-            last_reading = time.ticks_ms() - READING_INTERVAL  # Force immediate reading
+    # Check registration status without initializing BLE
+    check_registration()
+    if is_registered:
+        print('Device already registered - BLE will remain disabled')
+        last_reading = time.ticks_ms() - READING_INTERVAL  # Force immediate reading
+        # Ensure BLE is completely disabled for registered devices
+        if ble_initialized:
+            disable_ble()
 
 def loop():
     """Main loop"""
@@ -233,11 +297,17 @@ def loop():
     check_interval = 10000 if not is_registered else 300000
     if time.ticks_diff(current_time, last_check) > check_interval:
         check_registration()
+        # Ensure BLE is disabled if device becomes registered
+        if is_registered and ble_initialized:
+            disable_ble()
     
     if not is_registered:
         rgb.fill_color(0xffffff)
     else:
         rgb.fill_color(0x000000)
+        # Ensure BLE stays disabled for registered devices
+        if ble_initialized:
+            disable_ble()
         if time.ticks_diff(current_time, last_reading) >= READING_INTERVAL:
             take_reading()
     

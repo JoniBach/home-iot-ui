@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NanoC6 Device Registration</title>
+</head>
+<body>
+    <div>
+        <h1>NanoC6 Device Registration</h1>
+        <button id="scanBtn">Scan for Devices</button>
+        <div id="error"></div>
+        <div id="deviceList"></div>
+        <p id="statusMessage">No devices found. Click "Scan for Devices" to start.</p>
+    </div>
+
+    <script>
+        let devices = [];
+        let isScanning = false;
+        let error = null;
+
+        const scanBtn = document.getElementById('scanBtn');
+        const errorDiv = document.getElementById('error');
+        const deviceList = document.getElementById('deviceList');
+        const statusMessage = document.getElementById('statusMessage');
+
+        const updateStatus = (id, status) => {
+            const i = devices.findIndex(d => d.device.id === id);
+            if (i > -1) {
+                devices[i].status = status;
+                renderDevices();
+            }
+        };
+
+        const renderDevices = () => {
+            if (devices.length === 0) {
+                deviceList.innerHTML = '';
+                statusMessage.hidden = isScanning;
+                statusMessage.textContent = isScanning ? 'Scanning for BLE devices...' : 'No devices found. Click "Scan for Devices" to start.';
+                return;
+            }
+
+            statusMessage.hidden = true;
+            deviceList.innerHTML = devices.map(d => `
+                <div>
+                    <div>
+                        <h3>${d.device.name || 'NanoC6 Device'}</h3>
+                        <span>${d.status}</span>
+                    </div>
+                    <div>
+                        ${d.connected ? `
+                            <button onclick="registerDevice('${d.device.id}')" ${d.status?.includes('Registering') ? 'disabled' : ''}>
+                                ${d.status?.includes('Registering') ? 'Registering...' : 'Register'}
+                            </button>
+                            <button onclick="disconnectDevice('${d.device.id}')">Disconnect</button>
+                        ` : `
+                            <button onclick="connectDevice('${d.device.id}')" ${isScanning ? 'disabled' : ''}>Connect</button>
+                        `}
+                        <button onclick="forgetDevice('${d.device.id}')">Forget</button>
+                    </div>
+                    ${d.rawData ? `
+                        <div>
+                            <div><strong>Last Update:</strong> ${d.lastUpdate || 'N/A'}</div>
+                            <div><strong>Raw Data (${d.rawData.length} bytes):</strong></div>
+                            <pre>${formatHex(d.rawData)}</pre>
+                            <div><strong>ASCII:</strong></div>
+                            <pre>${formatAscii(d.rawData)}</pre>
+                        </div>
+                    ` : ''}
+                </div>
+            `).join('');
+        };
+
+        const scanDevices = async () => {
+            try {
+                if (!navigator.bluetooth) throw new Error('Web Bluetooth not supported');
+                isScanning = true;
+                error = null;
+                scanBtn.disabled = true;
+                scanBtn.textContent = 'Scanning...';
+                errorDiv.hidden = true;
+                renderDevices();
+
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ namePrefix: 'NanoC6' }],
+                    optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
+                });
+
+                if (!devices.some(d => d.device.id === device.id)) {
+                    devices.push({ device, connected: false, status: 'Found' });
+                    renderDevices();
+                    connectDevice(device.id);
+                }
+            } catch (err) {
+                if (err.name !== 'NotFoundError') {
+                    error = `Scan failed: ${err.message}`;
+                    errorDiv.textContent = error;
+                    errorDiv.hidden = false;
+                }
+            } finally {
+                isScanning = false;
+                scanBtn.disabled = false;
+                scanBtn.textContent = 'Scan for Devices';
+                renderDevices();
+            }
+        };
+
+        const connectDevice = async (id) => {
+            const i = devices.findIndex(d => d.device.id === id);
+            if (i === -1) return;
+            updateStatus(id, 'Connecting...');
+
+            try {
+                const server = await devices[i].device.gatt?.connect();
+                if (!server) throw new Error('GATT failed');
+
+                for (const service of await server.getPrimaryServices()) {
+                    const chars = await service.getCharacteristics();
+                    const char = chars.find(c => c.properties.write || c.properties.writeWithoutResponse || c.properties.notify);
+                    if (char) {
+                        devices[i].characteristic = char;
+                        devices[i].connected = true;
+                        if (char.properties.notify) setupNotifications(id, char);
+                        break;
+                    }
+                }
+                updateStatus(id, 'Connected');
+            } catch (err) {
+                updateStatus(id, `Error: ${err.message}`);
+            }
+        };
+
+        const setupNotifications = async (id, char) => {
+            try {
+                await char.startNotifications();
+                char.addEventListener('characteristicvaluechanged', (e) => {
+                    if (e.target.value) {
+                        const i = devices.findIndex(d => d.device.id === id);
+                        if (i > -1) {
+                            devices[i].rawData = new Uint8Array(e.target.value.buffer);
+                            devices[i].lastUpdate = new Date().toLocaleTimeString();
+                            renderDevices();
+                        }
+                    }
+                });
+                updateStatus(id, 'Receiving data');
+            } catch (err) {
+                updateStatus(id, `Notification error: ${err.message}`);
+            }
+        };
+
+        const registerDevice = async (id) => {
+            const i = devices.findIndex(d => d.device.id === id);
+            if (i === -1 || !devices[i].characteristic) return;
+            updateStatus(id, 'Registering...');
+
+            try {
+                const char = devices[i].characteristic;
+                await char.writeValue(new TextEncoder().encode('REGISTER'));
+
+                await new Promise((resolve) => {
+                    const timeout = setTimeout(() => {
+                        updateStatus(id, 'Registration timeout');
+                        resolve(false);
+                    }, 10000);
+
+                    const handler = (e) => {
+                        if (e.target.value) {
+                            const resp = new TextDecoder().decode(e.target.value);
+                            if (resp.includes('REGISTERED')) {
+                                clearTimeout(timeout);
+                                char.removeEventListener('characteristicvaluechanged', handler);
+                                updateStatus(id, 'Registration successful');
+                                setTimeout(() => disconnectDevice(id), 500);
+                                resolve(true);
+                            } else if (resp.includes('REGISTER_FAILED')) {
+                                clearTimeout(timeout);
+                                char.removeEventListener('characteristicvaluechanged', handler);
+                                updateStatus(id, 'Registration failed');
+                                resolve(false);
+                            }
+                        }
+                    };
+                    char.addEventListener('characteristicvaluechanged', handler);
+                });
+            } catch (err) {
+                updateStatus(id, `Registration error: ${err.message}`);
+            }
+        };
+
+        const disconnectDevice = async (id) => {
+            const i = devices.findIndex(d => d.device.id === id);
+            if (i === -1) return;
+
+            try {
+                if (devices[i].device.gatt?.connected) {
+                    await devices[i].device.gatt.disconnect();
+                }
+                devices[i].connected = false;
+                devices[i].status = 'Disconnected';
+                devices[i].characteristic = undefined;
+                renderDevices();
+            } catch (err) {
+                updateStatus(id, `Disconnect error: ${err.message}`);
+            }
+        };
+
+        const forgetDevice = (id) => {
+            devices = devices.filter(d => d.device.id !== id);
+            renderDevices();
+        };
+
+        const formatHex = (data) => {
+            return Array.from(data)
+                .map(b => b.toString(16).padStart(2, '0').toUpperCase())
+                .join(' ');
+        };
+
+        const formatAscii = (data) => {
+            return String.fromCharCode(...data)
+                .split('')
+                .map(c => c.charCodeAt(0) < 32 ? '.' : c)
+                .join('');
+        };
+
+        // Event listeners
+        scanBtn.addEventListener('click', scanDevices);
+
+        // Make functions global for onclick handlers
+        window.connectDevice = connectDevice;
+        window.registerDevice = registerDevice;
+        window.disconnectDevice = disconnectDevice;
+        window.forgetDevice = forgetDevice;
+
+        // Initial render
+        renderDevices();
+    </script>
+</body>
+</html>
